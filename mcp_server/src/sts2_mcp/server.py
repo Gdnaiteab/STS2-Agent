@@ -420,6 +420,24 @@ def create_server(client: Sts2Client | None = None, tool_profile: str | None = N
     _reset_game_data_cache()
     mcp = FastMCP("STS2 AI Agent")
 
+    def _available_actions() -> list[dict[str, Any]]:
+        kinds = {spec.name: spec.kind for spec in _LEGACY_ACTION_TOOLS}
+        actions = []
+        for action in sts2.get_available_actions():
+            kind = kinds.get(action.get("name"))
+            if action.get("requires_index") and kind in {"card_target", "option_index", "option_target"}:
+                index_field = "card_index" if kind == "card_target" else "option_index"
+                other_index = "option_index" if index_field == "card_index" else "card_index"
+                # Narrow the shared act schema before a model-generated action is sent.
+                # A null unused index remains valid for clients that echo act defaults.
+                action = {**action, "input_schema": {
+                    "type": "object",
+                    "properties": {index_field: {"type": "integer"}, other_index: {"type": "null"}},
+                    "required": [index_field],
+                }}
+            actions.append(action)
+        return actions
+
     def _agent_state() -> dict[str, Any]:
         state = sts2.get_state()
         agent_view = state.get("agent_view")
@@ -459,7 +477,7 @@ def create_server(client: Sts2Client | None = None, tool_profile: str | None = N
                 "matched": False,
                 "event": None,
                 "state": state,
-                "actions": sts2.get_available_actions(),
+                "actions": _available_actions(),
                 "timeout_seconds": timeout,
                 "source": "state",
             }
@@ -497,7 +515,7 @@ def create_server(client: Sts2Client | None = None, tool_profile: str | None = N
             "matched": event is not None,
             "event": event,
             "state": state,
-            "actions": sts2.get_available_actions(),
+            "actions": _available_actions(),
             "timeout_seconds": timeout,
             "source": source,
         }
@@ -519,8 +537,8 @@ def create_server(client: Sts2Client | None = None, tool_profile: str | None = N
 
     @mcp.tool
     def get_available_actions() -> list[dict[str, Any]]:
-        """List currently executable actions with `requires_index` and `requires_target` hints."""
-        return sts2.get_available_actions()
+        """List executable actions with per-action index schemas and target hints."""
+        return _available_actions()
 
     if profile in {"full", "layered"}:
         @mcp.tool
