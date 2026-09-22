@@ -435,6 +435,21 @@ def create_server(client: Sts2Client | None = None, tool_profile: str | None = N
                     "properties": {index_field: {"type": "integer"}, other_index: {"type": "null"}},
                     "required": [index_field],
                 }}
+                if kind == "card_target":
+                    hand = (sts2.get_state().get("combat") or {}).get("hand", [])
+                    choices = []
+                    for card in hand:
+                        choice = {"properties": {"card_index": {"const": card["index"]}}}
+                        if card.get("requires_target"):
+                            choice["properties"]["target_index"] = {
+                                "type": "integer", "enum": card.get("valid_target_indices", []),
+                            }
+                            choice["required"] = ["target_index"]
+                        choices.append(choice)
+                    if choices:
+                        action["input_schema"]["oneOf"] = choices
+                    # Target requirements belong to the selected card, not play_card as a whole.
+                    action.pop("requires_target", None)
             actions.append(action)
         return actions
 
@@ -777,17 +792,32 @@ def create_server(client: Sts2Client | None = None, tool_profile: str | None = N
         if normalized == "run_console_command":
             raise RuntimeError("run_console_command is gated separately and must use its own tool when enabled.")
 
-        return sts2.execute_action(
-            normalized,
-            card_index=card_index,
-            target_index=target_index,
-            option_index=option_index,
-            client_context={
-                "source": "mcp",
-                "tool_name": "act",
-                "tool_profile": profile,
-            },
-        )
+        try:
+            return sts2.execute_action(
+                normalized,
+                card_index=card_index,
+                target_index=target_index,
+                option_index=option_index,
+                client_context={
+                    "source": "mcp",
+                    "tool_name": "act",
+                    "tool_profile": profile,
+                },
+            )
+        except Sts2ApiError as exc:
+            # These Mod validation errors are raised before the requested effect.
+            # Timeouts, transport failures and invalid_action do not prove that.
+            if (exc.status_code, exc.code) not in {(400, "invalid_request"), (409, "invalid_target")}:
+                raise
+            return {
+                "action": normalized,
+                "accepted": False,
+                "execution_status": "not_executed",
+                "recovery": "correct_action",
+                "error_code": exc.code,
+                "message": exc.message,
+                "details": exc.details,
+            }
 
     if profile == "full":
         _register_legacy_action_tools(mcp, sts2)

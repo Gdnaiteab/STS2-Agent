@@ -659,7 +659,9 @@ class Sts2Client:
             headers["Content-Type"] = "application/json; charset=utf-8"
 
         last_error: Sts2ApiError | None = None
-        attempts = 1 + self._max_retries
+        # An action may already have taken effect when its response is lost.
+        # Only reads may be replayed; the caller must re-observe after an action failure.
+        attempts = 1 if is_action else 1 + self._max_retries
 
         for attempt in range(attempts):
             if attempt > 0:
@@ -679,7 +681,7 @@ class Sts2Client:
                     return self._decode_success(response.read(), expect_object_data=expect_object_data)
             except error.HTTPError as exc:
                 last_error = self._build_api_error(exc.code, exc.read())
-                if not last_error.retryable or attempt >= self._max_retries:
+                if not last_error.retryable or attempt >= attempts - 1:
                     raise last_error
             except error.URLError as exc:
                 last_error = Sts2ApiError(
@@ -692,7 +694,7 @@ class Sts2Client:
                     details={"reason": str(exc.reason), "path": path},
                     retryable=True,
                 )
-                if attempt >= self._max_retries:
+                if attempt >= attempts - 1:
                     raise last_error
 
         raise last_error or AssertionError("unreachable")
