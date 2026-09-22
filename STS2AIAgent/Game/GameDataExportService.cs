@@ -209,7 +209,10 @@ internal static class GameDataExportService
     private static object[] BuildMonsterMoves(MonsterModel monster)
     {
         var prefix = $"{monster.Id.Entry}.moves.";
-        return monster.MoveNames
+        // Canonical models have no move state machine; read the live localization
+        // table (including its language fallback), not bestiary animation models.
+        return LocManager.Instance.GetTable("monsters").GetLocStringsWithPrefix(prefix)
+            .OrderBy(locString => locString.LocEntryKey, StringComparer.Ordinal)
             .Select(locString => new
             {
                 id = ExtractKeySegment(locString.LocEntryKey, prefix),

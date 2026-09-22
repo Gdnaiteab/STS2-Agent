@@ -1,3 +1,4 @@
+using STS2AIAgent.Server;
 using System.Collections;
 using System.Reflection;
 using System.Text.RegularExpressions;
@@ -1328,6 +1329,31 @@ internal static class GameStateService
         return null;
     }
 
+    public static bool TryGetGridSelectionState(
+        IScreenContext? screen,
+        out CardSelectorPrefs prefs,
+        out IReadOnlyCollection<CardModel> selectedCards)
+    {
+        prefs = default;
+        selectedCards = Array.Empty<CardModel>();
+        if (screen is not (NSimpleCardSelectScreen or NDeckCardSelectScreen))
+        {
+            return false;
+        }
+
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var type = screen.GetType();
+        if (type.GetField("_prefs", flags)?.GetValue(screen) is not CardSelectorPrefs selectionPrefs ||
+            type.GetField("_selectedCards", flags)?.GetValue(screen) is not IReadOnlyCollection<CardModel> selectionCards)
+        {
+            throw new ApiException(503, "state_unavailable", "Grid selection preferences or selected cards are unavailable.");
+        }
+
+        prefs = selectionPrefs;
+        selectedCards = selectionCards;
+        return true;
+    }
+
     public static bool TryGetCombatHandSelectionMetadata(
         IScreenContext? currentScreen,
         out NPlayerHand? hand,
@@ -1762,6 +1788,13 @@ internal static class GameStateService
         return reason.ToString();
     }
 
+    internal static bool IsLocalPlayerPlayPhase(CombatState? combatState)
+    {
+        // v0.107 tracks the play phase per player (including multiplayer setup).
+        return combatState?.CurrentSide == CombatSide.Player &&
+            LocalContext.GetMe(combatState)?.PlayerCombatState?.Phase == PlayerTurnPhase.Play;
+    }
+
     private static bool CanUseCombatActions(IScreenContext? currentScreen, CombatState? combatState, out Player? me, out NCombatRoom? combatRoom)
     {
         me = null;
@@ -1776,7 +1809,7 @@ internal static class GameStateService
 
         if (!CombatManager.Instance.IsInProgress ||
             CombatManager.Instance.IsOverOrEnding ||
-            !CombatManager.Instance.IsPlayPhase ||
+            !IsLocalPlayerPlayPhase(combatState) ||
             CombatManager.Instance.PlayerActionsDisabled)
         {
             return false;
@@ -2316,6 +2349,7 @@ internal static class GameStateService
             min = selection.min_select,
             max = selection.max_select,
             selected = selection.selected_count,
+            selected_indices = selection.cards.Where(card => card.selected == true).Select(card => card.index).ToArray(),
             confirm = selection.can_confirm,
             cards = selection.cards.Select(card => BuildAgentChoiceCardPayload(card.index, card.name, card.upgraded, card.energy_cost, card.star_cost, card.costs_x, card.star_costs_x, GetPreferredCardRulesText(card.rules_text, card.resolved_rules_text), glossaryTerms)).ToArray()
         };
@@ -3292,9 +3326,18 @@ internal static class GameStateService
             return null;
         }
 
-        var combatHandSelection = TryGetCombatHandSelectionMetadata(currentScreen, out _, out var metadata)
+        var selection = TryGetCombatHandSelectionMetadata(currentScreen, out _, out var metadata)
             ? metadata
-            : default;
+            : new CombatHandSelectionMetadata(1, 1, 0, false, false);
+        IReadOnlyCollection<CardModel> selectedCards = Array.Empty<CardModel>();
+        var isGridSelection = TryGetGridSelectionState(currentScreen, out var prefs, out selectedCards);
+        if (isGridSelection)
+        {
+            var confirmButton = ((Node)currentScreen!).GetNodeOrNull<NConfirmButton>("%Confirm");
+            selection = new CombatHandSelectionMetadata(
+                prefs.MinSelect, prefs.MaxSelect, selectedCards.Count, prefs.RequireManualConfirmation,
+                confirmButton?.IsEnabled == true && confirmButton.IsVisibleInTree());
+        }
 
         return new SelectionPayload
         {
@@ -3310,12 +3353,12 @@ internal static class GameStateService
                 _ => "deck_card_select"
             },
             prompt = GetDeckSelectionPrompt(currentScreen) ?? string.Empty,
-            min_select = combatHandSelection.MinSelect,
-            max_select = combatHandSelection.MaxSelect,
-            selected_count = combatHandSelection.SelectedCount,
-            requires_confirmation = combatHandSelection.RequiresConfirmation,
-            can_confirm = combatHandSelection.CanConfirm,
-            cards = cards.Select((holder, index) => BuildSelectionCardPayload(holder.CardModel!, index)).ToArray()
+            min_select = selection.MinSelect,
+            max_select = selection.MaxSelect,
+            selected_count = selection.SelectedCount,
+            requires_confirmation = selection.RequiresConfirmation,
+            can_confirm = selection.CanConfirm,
+            cards = cards.Select((holder, index) => BuildSelectionCardPayload(holder.CardModel!, index, isGridSelection ? selectedCards.Contains(holder.CardModel!) : null)).ToArray()
         };
     }
 
@@ -4482,13 +4525,14 @@ internal static class GameStateService
         };
     }
 
-    private static SelectionCardPayload BuildSelectionCardPayload(CardModel card, int index)
+    private static SelectionCardPayload BuildSelectionCardPayload(CardModel card, int index, bool? selected)
     {
         var resolvedRulesText = GetResolvedCardRulesText(card);
         var dynamicValues = BuildCardDynamicValuePayloads(card);
         return new SelectionCardPayload
         {
             index = index,
+            selected = selected,
             card_id = card.Id.Entry,
             name = card.Title,
             upgraded = card.IsUpgraded,
@@ -5952,6 +5996,8 @@ internal sealed class DeckCardPayload
 internal sealed class SelectionCardPayload
 {
     public int index { get; init; }
+
+    public bool? selected { get; init; }
 
     public string card_id { get; init; } = string.Empty;
 

@@ -236,7 +236,7 @@ internal static class GameActionService
             return true;
         }
 
-        return !CombatManager.Instance.IsPlayPhase;
+        return !GameStateService.IsLocalPlayerPlayPhase(combatState);
     }
 
     private static async Task<ActionResponsePayload> ExecutePlayCardAsync(ActionRequest request)
@@ -935,7 +935,7 @@ internal static class GameActionService
                 combatRoom.Mode == CombatRoomMode.ActiveCombat &&
                 CombatManager.Instance.IsInProgress &&
                 !CombatManager.Instance.IsOverOrEnding &&
-                CombatManager.Instance.IsPlayPhase &&
+                GameStateService.IsLocalPlayerPlayPhase(CombatManager.Instance.DebugOnlyGetState()) &&
                 !CombatManager.Instance.PlayerActionsDisabled &&
                 CombatManager.Instance.DebugOnlyGetState() != null;
         }
@@ -1271,6 +1271,9 @@ internal static class GameActionService
         }
 
         var isCombatHandSelection = GameStateService.TryGetCombatHandSelectionMetadata(currentScreen, out var combatHand, out var combatHandSelection);
+        int? previousSelectedCount = GameStateService.TryGetGridSelectionState(currentScreen, out _, out var selectedCards)
+            ? selectedCards.Count
+            : null;
         var selected = options[request.option_index.Value];
         if (isCombatHandSelection)
         {
@@ -1297,7 +1300,7 @@ internal static class GameActionService
 
         var stable = currentScreen switch
         {
-            NCardGridSelectionScreen cardSelectScreen => await ConfirmDeckSelectionAsync(cardSelectScreen, TimeSpan.FromSeconds(10)),
+            NCardGridSelectionScreen cardSelectScreen => await ConfirmDeckSelectionAsync(cardSelectScreen, TimeSpan.FromSeconds(10), previousSelectedCount),
             NChooseACardSelectionScreen chooseCardScreen => await WaitForChooseCardSelectionResolutionAsync(chooseCardScreen, TimeSpan.FromSeconds(10)),
             _ when isCombatHandSelection => await WaitForCombatHandSelectionStepAsync(combatHandSelection, TimeSpan.FromSeconds(10)),
             _ => false
@@ -1702,7 +1705,7 @@ internal static class GameActionService
         return false;
     }
 
-    private static async Task<bool> ConfirmDeckSelectionAsync(NCardGridSelectionScreen screen, TimeSpan timeout)
+    private static async Task<bool> ConfirmDeckSelectionAsync(NCardGridSelectionScreen screen, TimeSpan timeout, int? previousSelectedCount = null)
     {
         var deadline = DateTime.UtcNow + timeout;
 
@@ -1711,6 +1714,14 @@ internal static class GameActionService
             await WaitForNextFrameAsync();
 
             if (!GodotObject.IsInstanceValid(screen))
+            {
+                return true;
+            }
+
+            // Selecting one card is a completed step even when more choices remain.
+            if (previousSelectedCount.HasValue &&
+                GameStateService.TryGetGridSelectionState(screen, out var prefs, out var selectedCards) &&
+                selectedCards.Count != previousSelectedCount.Value && selectedCards.Count < prefs.MaxSelect)
             {
                 return true;
             }
@@ -3339,6 +3350,15 @@ internal static class GameActionService
             });
 
         var target = ResolvePotionTarget(request, combatState, potion);
+        if (!potion.IsValidTarget(target))
+        {
+            throw new ApiException(409, "invalid_target", "The target is not valid for this potion.", new
+            {
+                action = "use_potion",
+                potion_id = potion.Id.Entry,
+                target_type = potion.TargetType.ToString()
+            });
+        }
         potion.EnqueueManualUse(target);
         var stable = await WaitForPotionUseTransitionAsync(player, request.option_index.Value, potion, TimeSpan.FromSeconds(10));
 
@@ -3719,8 +3739,9 @@ internal static class GameActionService
         {
             TargetType.AnyEnemy => ResolvePotionEnemyTarget(request, combatState, potion),
             TargetType.AnyPlayer when GameStateService.PotionRequiresTarget(combatState, potion) => ResolvePotionPlayerTarget(request, combatState, potion),
-            TargetType.TargetedNoCreature => null,
-            _ => potion.Owner.Creature
+            TargetType.AnyAlly => ResolvePotionPlayerTarget(request, combatState, potion),
+            TargetType.Self or TargetType.AnyPlayer => potion.Owner.Creature,
+            _ => null
         };
     }
 
@@ -3783,7 +3804,7 @@ internal static class GameActionService
             });
         }
 
-        var playerTargetIndices = GameStateService.GetTargetablePlayerIndices(combatState, potion.Owner, allowSelf: true);
+        var playerTargetIndices = GameStateService.GetTargetablePlayerIndices(combatState, potion.Owner, allowSelf: potion.TargetType != TargetType.AnyAlly);
         if (!playerTargetIndices.Contains(request.target_index.Value))
         {
             throw new ApiException(409, "invalid_target", "target_index is out of range for combat.players[].", new
@@ -4273,6 +4294,15 @@ internal static class GameActionService
             if (HasPotionUseSettled(player, potionIndex, potion))
             {
                 return true;
+            }
+
+            if (!potion.IsQueued && !HasPotionSlotTransitioned(player, potionIndex, potion))
+            {
+                throw new ApiException(409, "action_canceled", "Potion use was canceled before it took effect.", new
+                {
+                    action = "use_potion",
+                    potion_id = potion.Id.Entry
+                });
             }
         }
 

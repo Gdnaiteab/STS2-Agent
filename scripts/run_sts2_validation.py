@@ -1895,7 +1895,7 @@ def suite_deferred_potion_flow(args: argparse.Namespace) -> dict[str, Any]:
 
     zero_cost_matches = [
         card for card in list(final_state["combat"]["hand"])
-        if card.get("card_id") == selected_card.get("card_id") and int(card.get("energy_cost") or -1) == 0
+        if card.get("card_id") == selected_card.get("card_id") and card.get("energy_cost") == 0
     ]
     if not zero_cost_matches:
         raise ValidationError(
@@ -1909,6 +1909,146 @@ def suite_deferred_potion_flow(args: argparse.Namespace) -> dict[str, Any]:
         "initial_status": use_response["data"]["status"],
         "initial_screen": selection_state.get("screen"),
         "selection_count": len(selection_cards),
+    }
+
+
+def suite_all_enemies_potion_flow(args: argparse.Namespace) -> dict[str, Any]:
+    client = ApiClient(base_url=args.base_url, timeout=args.timeout_sec, retries=0)
+    client.request("GET", "/health")
+    state = client.get_state()
+    if state.get("screen") == "CARD_SELECTION":
+        raise ValidationError("all-enemies potion flow expects a stable diagnostic run, not CARD_SELECTION.")
+
+    state = continue_from_main_menu_if_needed(client, state, attempts=args.poll_attempts, delay_ms=args.poll_delay_ms)
+    state = collect_rewards_if_needed(client, state, attempts=args.poll_attempts, delay_ms=args.poll_delay_ms)
+    run_debug_command(client, "fight BYRDONIS_ELITE")
+    state = client.wait_for_state(
+        "enter diagnostic BYRDONIS combat",
+        lambda current: current.get("screen") == "COMBAT"
+        and any(enemy.get("enemy_id") == "BYRDONIS" for enemy in current["combat"]["enemies"]),
+        attempts=args.poll_attempts,
+        delay_ms=args.poll_delay_ms,
+    )
+    if not any(not potion.get("occupied") for potion in state["run"]["potions"]):
+        discardable = next((potion for potion in state["run"]["potions"] if potion.get("can_discard")), None)
+        if discardable is None:
+            raise ValidationError("Expected a free or discardable diagnostic potion slot.")
+        ensure_action_ok(client.action("discard_potion", option_index=int(discardable["index"])), "discard_potion")
+
+    run_debug_command(client, "potion EXPLOSIVE_AMPOULE")
+    state = client.wait_for_state(
+        "usable EXPLOSIVE_AMPOULE",
+        lambda current: current.get("screen") == "COMBAT" and any(
+            potion.get("potion_id") == "EXPLOSIVE_AMPOULE" and potion.get("can_use")
+            for potion in current["run"]["potions"]
+        ),
+        attempts=args.poll_attempts,
+        delay_ms=args.poll_delay_ms,
+    )
+    potion = next(potion for potion in state["run"]["potions"] if potion.get("potion_id") == "EXPLOSIVE_AMPOULE")
+    if potion.get("target_type") != "AllEnemies" or potion.get("requires_target"):
+        raise ValidationError(f"Expected untargeted AllEnemies potion, received: {json.dumps(potion, ensure_ascii=False)}")
+    enemy_hp_before = sum(int(enemy["current_hp"]) for enemy in state["combat"]["enemies"])
+    started = time.monotonic()
+    response = ensure_action_ok(client.action("use_potion", option_index=int(potion["index"])), "use_potion(EXPLOSIVE_AMPOULE)")
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    result = response["data"]
+    if result.get("status") != "completed" or not result.get("stable") or elapsed_ms >= 8000:
+        raise ValidationError(f"Expected completed/stable potion use below 8 seconds, received after {elapsed_ms}ms: {json.dumps(response, ensure_ascii=False)}")
+    final_state = result["state"]
+    used_slot = next((slot for slot in final_state["run"]["potions"] if slot.get("index") == potion["index"]), None)
+    if used_slot is not None and used_slot.get("occupied") and used_slot.get("potion_id") == "EXPLOSIVE_AMPOULE":
+        raise ValidationError("EXPLOSIVE_AMPOULE remained in its slot after completed use.")
+    enemy_hp_after = sum(int(enemy["current_hp"]) for enemy in (final_state.get("combat") or {}).get("enemies", []))
+    if enemy_hp_after >= enemy_hp_before:
+        raise ValidationError(f"Expected potion to damage enemies: HP before={enemy_hp_before}, after={enemy_hp_after}.")
+    return {
+        "potion_id": potion["potion_id"],
+        "status": result["status"],
+        "stable": result["stable"],
+        "elapsed_ms": elapsed_ms,
+        "enemy_hp_before": enemy_hp_before,
+        "enemy_hp_after": enemy_hp_after,
+        "potion_consumed": True,
+    }
+
+
+def suite_two_card_event_flow(args: argparse.Namespace) -> dict[str, Any]:
+    client = ApiClient(base_url=args.base_url, timeout=args.timeout_sec, retries=0)
+    client.request("GET", "/health")
+    state = client.get_state()
+    if state.get("screen") == "CARD_SELECTION":
+        raise ValidationError("two-card event flow expects a stable diagnostic run, not CARD_SELECTION.")
+
+    state = continue_from_main_menu_if_needed(client, state, attempts=args.poll_attempts, delay_ms=args.poll_delay_ms)
+    state = collect_rewards_if_needed(client, state, attempts=args.poll_attempts, delay_ms=args.poll_delay_ms)
+    run_debug_command(client, "event ROOM_FULL_OF_CHEESE")
+    state = client.wait_for_state(
+        "ROOM_FULL_OF_CHEESE event",
+        lambda current: (current.get("event") or {}).get("event_id") == "ROOM_FULL_OF_CHEESE",
+        attempts=args.poll_attempts,
+        delay_ms=args.poll_delay_ms,
+    )
+    deck_before = list(state["run"]["deck"])
+    gorge = next((option for option in state["event"]["options"] if str(option.get("text_key", "")).endswith(".GORGE")), None)
+    if gorge is None or gorge.get("is_locked"):
+        raise ValidationError("Expected the unlocked ROOM_FULL_OF_CHEESE GORGE option.")
+    ensure_action_ok(client.action("choose_event_option", option_index=int(gorge["index"])), "choose_event_option(GORGE)")
+    state = client.wait_for_state(
+        "two-card selection",
+        lambda current: current.get("screen") == "CARD_SELECTION",
+        attempts=args.poll_attempts,
+        delay_ms=args.poll_delay_ms,
+    )
+    selection = state.get("selection") or {}
+    if selection.get("min_select") != 2 or selection.get("max_select") != 2 or selection.get("selected_count") != 0:
+        raise ValidationError(f"Expected fresh min/max=2 selection, received: {json.dumps(selection, ensure_ascii=False)}")
+    cards = list(selection.get("cards") or [])
+    if len(cards) < 2:
+        raise ValidationError("Expected at least two offered cards.")
+    selected_cards = []
+    elapsed_times = []
+    for step in range(2):
+        selected_card = next((card for card in cards if card.get("selected") is False), None)
+        if selected_card is None:
+            raise ValidationError("Expected an explicitly unselected card option.")
+        selected_cards.append(selected_card)
+        started = time.monotonic()
+        response = ensure_action_ok(client.action("select_deck_card", option_index=int(selected_card["index"])), "select_deck_card")
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        elapsed_times.append(elapsed_ms)
+        result = response["data"]
+        if result.get("status") != "completed" or not result.get("stable") or elapsed_ms >= 8000:
+            raise ValidationError(f"Expected completed/stable selection below 8 seconds, received after {elapsed_ms}ms: {json.dumps(response, ensure_ascii=False)}")
+        state = result["state"]
+        if step == 0:
+            selection = state.get("selection") or {}
+            cards = list(selection.get("cards") or [])
+            chosen = next((card for card in cards if card.get("index") == selected_card["index"]), None)
+            if state.get("screen") != "CARD_SELECTION" or selection.get("selected_count") != 1 or chosen is None or chosen.get("selected") is not True:
+                raise ValidationError(f"Expected the first card to remain selected with selected_count=1: {json.dumps(selection, ensure_ascii=False)}")
+
+    final_state = client.wait_for_state(
+        "finished cheese event with two added cards",
+        lambda current: current.get("screen") != "CARD_SELECTION"
+        and (current.get("event") or {}).get("is_finished") is True
+        and len(current["run"]["deck"]) == len(deck_before) + 2,
+        attempts=args.poll_attempts,
+        delay_ms=args.poll_delay_ms,
+    )
+    before_ids = [card["card_id"] for card in deck_before]
+    after_ids = [card["card_id"] for card in final_state["run"]["deck"]]
+    chosen_ids = [card["card_id"] for card in selected_cards]
+    for card_id in set(chosen_ids):
+        if after_ids.count(card_id) - before_ids.count(card_id) != chosen_ids.count(card_id):
+            raise ValidationError(f"Selected card {card_id} was not added to the deck the expected number of times.")
+    return {
+        "event_id": "ROOM_FULL_OF_CHEESE",
+        "selected_card_ids": chosen_ids,
+        "selection_elapsed_ms": elapsed_times,
+        "deck_count_before": len(deck_before),
+        "deck_count_after": len(after_ids),
+        "event_finished": True,
     }
 
 
@@ -2559,6 +2699,16 @@ def build_parser() -> argparse.ArgumentParser:
     for name, (arg_type, kwargs) in common_api.items():
         deferred_potion.add_argument(name, type=arg_type, **kwargs)
     deferred_potion.set_defaults(func=suite_deferred_potion_flow)
+
+    all_enemies_potion = subparsers.add_parser("all-enemies-potion-flow", help="Use an explosive ampoule in a debug combat (mutates the diagnostic run).")
+    for name, (arg_type, kwargs) in common_api.items():
+        all_enemies_potion.add_argument(name, type=arg_type, **kwargs)
+    all_enemies_potion.set_defaults(func=suite_all_enemies_potion_flow, timeout_sec=15.0)
+
+    two_card_event = subparsers.add_parser("two-card-event-flow", help="Choose two cheese-event cards in a debug run (mutates the diagnostic run).")
+    for name, (arg_type, kwargs) in common_api.items():
+        two_card_event.add_argument(name, type=arg_type, **kwargs)
+    two_card_event.set_defaults(func=suite_two_card_event_flow, timeout_sec=15.0)
 
     target_index = subparsers.add_parser("target-index-contract")
     for name, (arg_type, kwargs) in common_api.items():
