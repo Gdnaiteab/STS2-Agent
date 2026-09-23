@@ -2750,8 +2750,12 @@ internal static class GameActionService
 
         var previousGold = inventory.Player.Gold;
         var previousRelicId = entry.Model?.Id.Entry;
-        var success = await entry.OnTryPurchaseWrapper(inventory);
-        if (!success)
+        // Relics can open rewards/selection that need another action before the
+        // purchase task completes. Return after the visible purchase transition.
+        var purchaseTask = entry.OnTryPurchaseWrapper(inventory);
+        ObserveBackgroundResult(purchaseTask, "buy_relic");
+        var stable = await WaitForMerchantRelicPurchaseAsync(purchaseTask, inventory.Player, entry, previousGold, previousRelicId, TimeSpan.FromSeconds(10));
+        if (purchaseTask.IsCompleted && !await purchaseTask)
         {
             throw new ApiException(409, "invalid_action", "Relic purchase failed in the current state.", new
             {
@@ -2760,7 +2764,6 @@ internal static class GameActionService
             });
         }
 
-        var stable = await WaitForMerchantRelicPurchaseAsync(inventory.Player, entry, previousGold, previousRelicId, TimeSpan.FromSeconds(10));
         return new ActionResponsePayload
         {
             action = "buy_relic",
@@ -3670,6 +3673,7 @@ internal static class GameActionService
     }
 
     private static async Task<bool> WaitForMerchantRelicPurchaseAsync(
+        Task<bool> purchaseTask,
         Player player,
         MerchantRelicEntry entry,
         int previousGold,
@@ -3679,6 +3683,11 @@ internal static class GameActionService
         var deadline = DateTime.UtcNow + timeout;
         while (DateTime.UtcNow < deadline)
         {
+            if (purchaseTask.IsCompleted && !await purchaseTask)
+            {
+                return false;
+            }
+
             await WaitForNextFrameAsync();
 
             var currentGold = player.Gold;
